@@ -1,0 +1,555 @@
+package org.example;
+
+import io.github.bonigarcia.wdm.WebDriverManager;
+import okhttp3.OkHttpClient;
+import org.openqa.selenium.*;
+import org.openqa.selenium.NoSuchElementException;
+import org.openqa.selenium.chrome.ChromeDriver;
+import org.openqa.selenium.chrome.ChromeOptions;
+import org.openqa.selenium.support.ui.ExpectedConditions;
+import org.openqa.selenium.support.ui.WebDriverWait;
+
+import java.io.File;
+import java.time.Duration;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.*;
+import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.stream.Collectors;
+
+import static org.example.FacebookBot2.*;
+
+public class BotWorker implements Runnable {
+    private static final String POST_CONTAINER_XPATH = "//div[contains(@class, 'x1yztbdb') and .//span[text()='Like'] and .//span[text()='Comment']]";
+    private static final String[] KEYWORDS = {"help", "advice", "?", "diet", "weight", "pain", "tips", "similar experience", "symptoms", "food", "aching", "success stories"};
+    private static final Duration POST_AGE_LIMIT = Duration.ofDays(2);
+
+    private final int id;
+    private final FacebookBot2.AccountInfo account;
+    private final FacebookBot2.BotConfig config;
+    private final AtomicInteger totalInteractions;
+    private final Set<String> processedPosts;
+    private final OkHttpClient httpClient;
+
+    private WebDriver driver;
+    private WebDriverWait wait;
+
+    public BotWorker(int id, FacebookBot2.AccountInfo account, FacebookBot2.BotConfig config,
+                     AtomicInteger totalInteractions, Set<String> processedPosts, OkHttpClient httpClient) {
+        this.id = id;
+        this.account = account;
+        this.config = config;
+        this.totalInteractions = totalInteractions;
+        this.processedPosts = processedPosts;
+        this.httpClient = httpClient;
+    }
+
+    @Override
+    public void run() {
+        log(id, info("Starting for " + account.email));
+        try {
+            initializeDriver();
+            loginToFacebook();
+            List<String> groupUrls = fetchGroups();
+            log(id, ok("Found " + groupUrls.size() + " groups"));
+            processGroups(groupUrls);
+        } catch (Exception e) {
+            log(id, fail("Fatal: " + e.getMessage()));
+        } finally {
+            if (driver != null) {
+                try { driver.quit(); } catch (Exception ignored) {}
+            }
+            log(id, info("Shut down"));
+        }
+    }
+
+    private void initializeDriver() {
+        String chromeDriverPath = "C:\\chromedriver\\chromedriver.exe";
+        if (new File(chromeDriverPath).exists()) {
+            System.setProperty("webdriver.chrome.driver", chromeDriverPath);
+        } else {
+            WebDriverManager.chromedriver().setup();
+        }
+
+        ChromeOptions options = new ChromeOptions();
+        List<String> argsList = new ArrayList<>(Arrays.asList(
+                "--disable-notifications",
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--remote-allow-origins=*",
+                "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+                "--window-size=1920,1080",
+                "--disable-extensions"
+        ));
+        if (config.headless) argsList.add("--headless=new");
+        if (config.incognito) argsList.add("--incognito");
+        options.addArguments(argsList);
+        options.setExperimentalOption("excludeSwitches", Collections.singletonList("enable-automation"));
+        options.setExperimentalOption("useAutomationExtension", false);
+
+        System.setProperty("webdriver.chrome.silentOutput", "true");
+        java.util.logging.Logger.getLogger("org.openqa.selenium").setLevel(java.util.logging.Level.OFF);
+
+        driver = new ChromeDriver(options);
+        wait = new WebDriverWait(driver, Duration.ofSeconds(20));
+    }
+
+    private void loginToFacebook() {
+        log(id, info("Logging in..."));
+        JavascriptExecutor js = (JavascriptExecutor) driver;
+
+        int maxAttempts = 3;
+        for (int attempt = 1; attempt <= maxAttempts; attempt++) {
+            try {
+                driver.get("https://mbasic.facebook.com/login/");
+                waitForPageLoad();
+
+                if (isLoggedIn()) {
+                    log(id, ok("Already logged in"));
+                    driver.get("https://www.facebook.com");
+                    return;
+                }
+
+                removeOverlays(js);
+                dismissAlert();
+
+                wait.until(ExpectedConditions.elementToBeClickable(
+                        By.xpath("//input[@name='email']"))).sendKeys(account.email);
+                wait.until(ExpectedConditions.elementToBeClickable(
+                        By.xpath("//input[@name='pass']"))).sendKeys(account.password);
+
+                WebElement loginBtn = wait.until(ExpectedConditions.elementToBeClickable(
+                        By.xpath("//button[@name='login']")));
+                js.executeScript("arguments[0].click();", loginBtn);
+                Thread.sleep(3000);
+
+                waitForCaptchaResolution();
+
+                driver.get("https://www.facebook.com");
+                waitForPageLoad();
+
+                if (isLoggedIn()) {
+                    log(id, ok("Logged in as " + account.email));
+                    return;
+                }
+                log(id, warn("Login attempt " + attempt + " failed, retrying..."));
+            } catch (Exception e) {
+                log(id, fail("Login attempt " + attempt + ": " + e.getMessage()));
+                if (attempt == maxAttempts) throw new RuntimeException("Login failed");
+            }
+        }
+    }
+
+    private boolean isLoggedIn() {
+        try {
+            wait.until(ExpectedConditions.presenceOfElementLocated(
+                    By.xpath("//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), \"what's on your mind\")"
+                            + " or contains(@placeholder, 'post')"
+                            + " or contains(@aria-label, 'Create a post')"
+                            + " or contains(@data-pagelet, 'Feed')"
+                            + " or contains(@id, 'mbasic_logout')"
+                            + " or contains(@href, '/logout')]")));
+            return true;
+        } catch (TimeoutException e) {
+            return false;
+        }
+    }
+
+    private boolean isSessionValid() {
+        try { driver.getCurrentUrl(); return true; } catch (Exception e) { return false; }
+    }
+
+    private List<String> fetchGroups() {
+        log(id, info("Fetching groups..."));
+        Set<String> groupUrls = new HashSet<>();
+        JavascriptExecutor js = (JavascriptExecutor) driver;
+
+        try {
+            driver.get("https://www.facebook.com/groups/feed?_=" + System.currentTimeMillis());
+            Thread.sleep(3000);
+
+            try {
+                WebElement seeAll = wait.until(ExpectedConditions.elementToBeClickable(
+                        By.xpath("//span[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'see all')]")));
+                js.executeScript("arguments[0].click();", seeAll);
+                Thread.sleep(3000);
+            } catch (Exception ignored) {}
+
+            for (int attempt = 1; attempt <= 10; attempt++) {
+                List<WebElement> groupLinks = driver.findElements(By.xpath(
+                        "//a[contains(@href, '/groups/') and contains(@role, 'link') " +
+                        "and not(contains(@href, 'groups/joined')) " +
+                        "and not(contains(@href, 'groups/members')) " +
+                        "and not(contains(@href, 'groups/discover'))]"));
+
+                for (WebElement link : groupLinks) {
+                    try {
+                        String href = link.getAttribute("href");
+                        if (href != null) {
+                            String clean = href.split("\\?")[0].replaceAll("/$", "");
+                            if (clean.matches("https://(www|web)\\.facebook\\.com/groups/\\d+/?$")) {
+                                groupUrls.add(clean);
+                            }
+                        }
+                    } catch (StaleElementReferenceException ignored) {}
+                }
+
+                if (groupUrls.size() >= 70) break;
+                js.executeScript("window.scrollBy(0, document.body.scrollHeight);");
+                Thread.sleep(3000);
+            }
+        } catch (Exception e) {
+            log(id, fail("Failed to fetch groups: " + e.getMessage()));
+        }
+
+        return new ArrayList<>(groupUrls);
+    }
+
+    private void processGroups(List<String> groupUrls) {
+        for (String groupUrl : groupUrls) {
+            if (totalInteractions.get() >= config.maxInteractions) {
+                log(id, warn("Max interactions reached, stopping"));
+                return;
+            }
+
+            log(id, info("Group: " + groupUrl));
+            int attempts = 0;
+            while (attempts < 3 && totalInteractions.get() < config.maxInteractions) {
+                try {
+                    if (!isSessionValid()) {
+                        log(id, warn("Session dead, reconnecting..."));
+                        reconnect();
+                    }
+                    interactWithGroup(groupUrl);
+                    break;
+                } catch (Exception e) {
+                    attempts++;
+                    log(id, fail("Attempt " + attempts + "/3: " + e.getMessage()));
+                    if (attempts < 3) sleep(5000);
+                }
+            }
+        }
+    }
+
+    private void reconnect() {
+        try { driver.quit(); } catch (Exception ignored) {}
+        initializeDriver();
+        loginToFacebook();
+    }
+
+    private void interactWithGroup(String groupUrl) throws Exception {
+        JavascriptExecutor js = (JavascriptExecutor) driver;
+
+        driver.get(groupUrl);
+        waitForPageLoad();
+        dismissAlert();
+        removeOverlays(js);
+
+        if (driver.getCurrentUrl().contains("login")) {
+            throw new Exception("Session expired");
+        }
+        waitForCaptchaResolution();
+        if (!isGroupPage()) {
+            log(id, warn("Not a valid group page, skipping"));
+            return;
+        }
+
+        selectNewPostsSort(js);
+
+        try {
+            wait.until(ExpectedConditions.presenceOfElementLocated(By.xpath(POST_CONTAINER_XPATH)));
+        } catch (TimeoutException e) {
+            try {
+                wait.until(ExpectedConditions.presenceOfElementLocated(By.xpath("//div[contains(@data-pagelet,'Feed')]")));
+            } catch (TimeoutException ignored) {}
+        }
+
+        List<WebElement> posts = loadPosts(js);
+        log(id, info("Loaded " + posts.size() + " posts"));
+
+        for (int i = 0; i < posts.size(); i++) {
+            if (totalInteractions.get() >= config.maxInteractions) {
+                log(id, warn("Daily limit reached"));
+                return;
+            }
+            try {
+                interactWithPost(posts.get(i), i + 1, js);
+            } catch (Exception e) {
+                log(id, fail("Post #" + (i + 1) + ": " + e.getMessage()));
+            }
+        }
+    }
+
+    private void selectNewPostsSort(JavascriptExecutor js) {
+        try {
+            List<WebElement> newPostsDropdown = driver.findElements(By.xpath(
+                    "//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'new posts')]"));
+            if (!newPostsDropdown.isEmpty()) return;
+
+            List<WebElement> dropdown = driver.findElements(By.xpath(
+                    "//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'most relevant')" +
+                    " or contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'recent activity')]"));
+            if (!dropdown.isEmpty()) {
+                js.executeScript("arguments[0].scrollIntoView({block: 'center'});", dropdown.get(0));
+                wait.until(ExpectedConditions.elementToBeClickable(dropdown.get(0))).click();
+                dismissAlert();
+
+                WebElement newPostsOption = wait.until(ExpectedConditions.elementToBeClickable(
+                        By.xpath("//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'new posts')]")));
+                js.executeScript("arguments[0].click();", newPostsOption);
+                wait.until(ExpectedConditions.presenceOfElementLocated(By.xpath(POST_CONTAINER_XPATH)));
+            }
+        } catch (Exception ignored) {}
+    }
+
+    private List<WebElement> loadPosts(JavascriptExecutor js) {
+        List<WebElement> posts = new ArrayList<>();
+        int prevCount = 0, unchanged = 0;
+
+        for (int attempt = 1; attempt <= 20 && unchanged < 3; attempt++) {
+            dismissAlert();
+            posts = driver.findElements(By.xpath(POST_CONTAINER_XPATH));
+            if (posts.size() >= 10) break;
+
+            if (posts.size() == prevCount) unchanged++;
+            else { unchanged = 0; prevCount = posts.size(); }
+
+            try {
+                WebElement btn = driver.findElement(By.xpath(
+                        "//span[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'see more')]"));
+                js.executeScript("arguments[0].click();", btn);
+                sleep(2000);
+            } catch (NoSuchElementException ignored) {}
+
+            js.executeScript("window.scrollBy(0, document.body.scrollHeight);");
+            sleep(4000 + ThreadLocalRandom.current().nextInt(2000));
+        }
+        return posts;
+    }
+
+    private void interactWithPost(WebElement post, int postIndex, JavascriptExecutor js) throws Exception {
+        dismissAlert();
+        removeOverlays(js);
+
+        List<WebElement> posts = driver.findElements(By.xpath(POST_CONTAINER_XPATH));
+        if (posts.size() < postIndex) return;
+        WebElement currentPost = posts.get(postIndex - 1);
+
+        wait.until(ExpectedConditions.visibilityOf(currentPost));
+        js.executeScript("arguments[0].scrollIntoView({behavior: 'smooth', block: 'center'});", currentPost);
+        highlightPost(currentPost);
+        sleep(ThreadLocalRandom.current().nextInt(2000, 4000));
+
+        String postId = extractPostId(currentPost);
+        synchronized (processedPosts) {
+            if (processedPosts.contains(postId)) {
+                log(id, warn("Already processed #" + postIndex + " (dup check)"));
+                return;
+            }
+        }
+
+        LocalDateTime postTime = getPostTime(currentPost);
+        if (postTime.isBefore(LocalDateTime.now().minus(POST_AGE_LIMIT))) {
+            log(id, warn("Post #" + postIndex + " too old"));
+            return;
+        }
+
+        String postText = cleanPostText(currentPost);
+        if (postText.trim().isEmpty() || !containsKeyword(postText)) {
+            log(id, warn("Post #" + postIndex + " no matching keywords"));
+            return;
+        }
+
+        clickLikeButton(currentPost, js);
+        sleep(ThreadLocalRandom.current().nextInt(1500, 3000));
+
+        String reply = generateReply(postText);
+        if (reply == null || reply.trim().isEmpty()) return;
+
+        postComment(currentPost, reply, js);
+
+        synchronized (processedPosts) { processedPosts.add(postId); }
+        totalInteractions.incrementAndGet();
+
+        log(id, ok("Post #" + postIndex + " liked + commented (total: " +
+                totalInteractions.get() + "/" + config.maxInteractions + ")"));
+
+        FacebookBot2.logInteraction(postText, reply);
+        sleep(ThreadLocalRandom.current().nextInt(4000, 8000));
+    }
+
+    private void clickLikeButton(WebElement post, JavascriptExecutor js) throws Exception {
+        try {
+            dismissAlert();
+            WebElement btn = wait.until(ExpectedConditions.elementToBeClickable(post.findElement(
+                    By.xpath(".//div[contains(@class, 'x1i10hfl') and (.//span[contains(text(), 'Like')] or @aria-label='Like')]"))));
+            js.executeScript("arguments[0].scrollIntoView({block: 'center'});", btn);
+            sleep(500);
+            js.executeScript("arguments[0].click();", btn);
+        } catch (Exception e) {
+            throw new Exception("Failed to like: " + e.getMessage());
+        }
+    }
+
+    private void postComment(WebElement post, String comment, JavascriptExecutor js) throws Exception {
+        String btnXPath = ".//div[contains(@class, 'x1i10hfl') and (.//span[contains(translate(text(), 'COMMENT', 'comment'), 'comment')] or contains(@aria-label, 'Comment')) and not(contains(@class, 'x1yztbdb'))]";
+        String primaryTA = "//div[@role='textbox' and @contenteditable='true' and (contains(@class, 'notranslate') or contains(@class, 'x1t2pt76'))]";
+        String fallbackTA = ".//div[contains(@class, 'x1n2onr6')]//div[@contenteditable='true']";
+
+        dismissAlert();
+        removeOverlays(js);
+
+        WebElement btn = wait.until(ExpectedConditions.elementToBeClickable(post.findElement(By.xpath(btnXPath))));
+        js.executeScript("arguments[0].click();", btn);
+        sleep(800);
+
+        WebElement textArea;
+        try {
+            textArea = wait.until(ExpectedConditions.elementToBeClickable(By.xpath(primaryTA)));
+        } catch (TimeoutException e) {
+            textArea = wait.until(ExpectedConditions.elementToBeClickable(post.findElement(By.xpath(fallbackTA))));
+        }
+
+        js.executeScript(
+                "arguments[0].focus(); arguments[0].innerText = arguments[1]; " +
+                "arguments[0].dispatchEvent(new InputEvent('input', {bubbles: true}));" +
+                "arguments[0].dispatchEvent(new Event('change', {bubbles: true}));",
+                textArea, comment.replaceAll("[\\r\\n]+", "\n").trim());
+        sleep(800);
+
+        dismissAlert();
+        js.executeScript("arguments[0].dispatchEvent(new KeyboardEvent('keydown', {key: 'Enter', bubbles: true, composed: true}));", textArea);
+        sleep(1500);
+    }
+
+    private String generateReply(String postText) throws Exception {
+        String prompt = String.format(
+                "Now I want to give a reply to this post on Facebook. But I want you to sketch out the reply to me. " +
+                "I want it to be very very friendly and encouraging. Let the first paragraph be directly addressing " +
+                "the question or issue raised in the post, Also you can add like a bit of my own experience " +
+                "(just draft it out yourself) Then how I've been managing it and how my doctor told me about how " +
+                "good an anti Inflammatory diet will help me in this my journey which it has really helped a lot. " +
+                "And he was also kind enough to tell me to go get a diet book in Amazon titled, " +
+                "\"Anti-Inflammatory Blueprint Chronicle: An Immersive look into Healthy dietary habits for Good Health\" " +
+                "(book title should be in uppercase) by Jeremy Nowak. Proceed to refer the person to the book. " +
+                "Also make the answer fairly detailed and realistic and helpful. stress on the diet part so that " +
+                "the person can be convinced to get the book. Also talk about my own symptoms and how frustrating " +
+                "it was. Till my doctor was kind enough to introduce the AIP diet to me. And talk about how it has " +
+                "helped me a lot and subdued my symptoms. Also give them other tips too, and when giving another tips, " +
+                "talk about stress management and how it's really important. Stress on the need of proper practices " +
+                "help ease there symptoms. Also tell her the reasons she should be considering the diet. It should be " +
+                "very convincing pls. Pls answer in a fairy detailed here. Also encourage her and cheer her up.\n\n" +
+                "Post content: " + postText);
+
+        return FacebookBot2.askAI(httpClient, config.model, prompt);
+    }
+
+    // --- Utility methods ---
+
+    private void waitForPageLoad() {
+        new WebDriverWait(driver, Duration.ofSeconds(30)).until(
+                wd -> ((JavascriptExecutor) wd).executeScript("return document.readyState").equals("complete"));
+    }
+
+    private void dismissAlert() {
+        try { driver.switchTo().alert().dismiss(); } catch (NoAlertPresentException ignored) {}
+    }
+
+    private void removeOverlays(JavascriptExecutor js) {
+        js.executeScript("document.querySelectorAll('div[role=\"dialog\"], div[class*=\"popup\"], div[class*=\"cookie\"], div[class*=\"modal\"], div[class*=\"tooltip\"]').forEach(el => el.style.display = 'none');");
+    }
+
+    private void highlightPost(WebElement post) {
+        ((JavascriptExecutor) driver).executeScript("arguments[0].style.boxShadow='0 0 0 3px rgba(255,0,0,0.5)';", post);
+    }
+
+    private boolean isGroupPage() {
+        String url = driver.getCurrentUrl();
+        if (!url.contains("/groups/") || url.contains("/groups/joined") || url.contains("/groups/members"))
+            return false;
+        return !driver.findElements(By.xpath("//h1[contains(@class, 'group-name')]")).isEmpty()
+                || !driver.findElements(By.xpath("//div[@role='article']")).isEmpty();
+    }
+
+    private boolean isActiveCaptchaPresent() {
+        try {
+            return !driver.findElements(By.xpath(
+                    "//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'captcha') " +
+                    "or contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'security check')" +
+                    " or @title='Security Check']"))
+                    .isEmpty();
+        } catch (Exception e) { return false; }
+    }
+
+    private void waitForCaptchaResolution() {
+        if (!isActiveCaptchaPresent()) return;
+
+        log(id, warn("CAPTCHA detected! Please solve it in the browser window."));
+        log(id, info("Waiting for CAPTCHA to be solved..."));
+
+        int waited = 0;
+        while (isActiveCaptchaPresent() && waited < 120) {
+            try { Thread.sleep(2000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); return; }
+            waited += 2;
+            dismissAlert();
+        }
+
+        if (isActiveCaptchaPresent()) {
+            log(id, fail("CAPTCHA not solved after 4 minutes. Continuing anyway..."));
+        } else {
+            log(id, ok("CAPTCHA solved! Continuing..."));
+            try { Thread.sleep(2000); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+        }
+    }
+
+    private String extractPostId(WebElement post) {
+        try {
+            String id = post.getAttribute("id");
+            if (id != null && id.startsWith("hyperfeed_story_")) return id;
+
+            List<WebElement> links = post.findElements(By.xpath(".//a[contains(@href,'/posts/')]"));
+            if (!links.isEmpty()) {
+                Matcher m = Pattern.compile("/posts/(\\d+)").matcher(links.get(0).getAttribute("href"));
+                if (m.find()) return m.group(1);
+            }
+        } catch (Exception ignored) {}
+        return "hash_" + Math.abs(post.getLocation().hashCode());
+    }
+
+    private LocalDateTime getPostTime(WebElement post) {
+        try {
+            WebElement el = post.findElement(By.xpath(".//abbr | .//a[contains(@href,'/posts/')]"));
+            return parseFacebookTime(el.getAttribute("title") != null ? el.getAttribute("title") : el.getText());
+        } catch (Exception e) { return LocalDateTime.now(); }
+    }
+
+    private LocalDateTime parseFacebookTime(String t) {
+        t = t.replace("\u00b7", "").trim();
+        if (t.contains("mins ago")) return LocalDateTime.now().minusMinutes(Integer.parseInt(t.replaceAll("\\D+", "")));
+        if (t.contains("hrs ago")) return LocalDateTime.now().minusHours(Integer.parseInt(t.replaceAll("\\D+", "")));
+        if (t.contains("Yesterday")) return LocalDateTime.now().minusDays(1);
+        try { return LocalDateTime.parse(t, DateTimeFormatter.ofPattern("MMMM d, yyyy 'at' h:mm a")); }
+        catch (Exception e) { return LocalDateTime.now(); }
+    }
+
+    private String cleanPostText(WebElement post) {
+        try {
+            return post.findElements(By.xpath(
+                    ".//div[@data-ad-preview='message'] | .//div[contains(@class,'x1iorvi4')] | .//div[contains(@class,'userContent')]"))
+                    .stream().map(WebElement::getText).collect(Collectors.joining("\n"))
+                    .replaceAll("\\s+", " ").trim();
+        } catch (Exception e) { return ""; }
+    }
+
+    private boolean containsKeyword(String text) {
+        return Arrays.stream(KEYWORDS).anyMatch(k -> text.toLowerCase().contains(k.toLowerCase()));
+    }
+
+    private void sleep(long ms) {
+        try { Thread.sleep(ms); } catch (InterruptedException e) { Thread.currentThread().interrupt(); }
+    }
+}
