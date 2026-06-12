@@ -23,9 +23,9 @@ import java.util.stream.Collectors;
 import static org.example.FacebookBot2.*;
 
 public class BotWorker implements Runnable {
-    private static final String POST_CONTAINER_XPATH = "//div[contains(@class, 'x1yztbdb') and .//span[text()='Like'] and .//span[text()='Comment']]";
+    private static final String POST_CONTAINER_XPATH = "//div[@role='article']";
     private static final String[] KEYWORDS = {"help", "advice", "?", "diet", "weight", "pain", "tips", "similar experience", "symptoms", "food", "aching", "success stories"};
-    private static final Duration POST_AGE_LIMIT = Duration.ofDays(2);
+    private static final Duration POST_AGE_LIMIT = Duration.ofHours(24);
 
     private final int id;
     private final FacebookBot2.AccountInfo account;
@@ -58,6 +58,7 @@ public class BotWorker implements Runnable {
             processGroups(groupUrls);
         } catch (Exception e) {
             log(id, fail("Fatal: " + e.getMessage()));
+            e.printStackTrace(System.out);
         } finally {
             if (driver != null) {
                 try { driver.quit(); } catch (Exception ignored) {}
@@ -74,6 +75,11 @@ public class BotWorker implements Runnable {
             WebDriverManager.chromedriver().setup();
         }
 
+        // A fresh, unique profile dir per launch so concurrent workers never share or
+        // collide on a profile, and nothing is reused across a reconnect.
+        String userDataDir = System.getProperty("java.io.tmpdir")
+                + File.separator + "fbagent_w" + id + "_" + System.nanoTime();
+
         ChromeOptions options = new ChromeOptions();
         List<String> argsList = new ArrayList<>(Arrays.asList(
                 "--disable-notifications",
@@ -83,10 +89,12 @@ public class BotWorker implements Runnable {
                 "--remote-allow-origins=*",
                 "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
                 "--window-size=1920,1080",
-                "--disable-extensions"
+                "--disable-extensions",
+                // Always incognito: each worker starts with no memory of any previous session.
+                "--incognito",
+                "--user-data-dir=" + userDataDir
         ));
         if (config.headless) argsList.add("--headless=new");
-        if (config.incognito) argsList.add("--incognito");
         options.addArguments(argsList);
         options.setExperimentalOption("excludeSwitches", Collections.singletonList("enable-automation"));
         options.setExperimentalOption("useAutomationExtension", false);
@@ -117,15 +125,33 @@ public class BotWorker implements Runnable {
                 removeOverlays(js);
                 dismissAlert();
 
-                wait.until(ExpectedConditions.elementToBeClickable(
-                        By.xpath("//input[@name='email']"))).sendKeys(account.email);
-                wait.until(ExpectedConditions.elementToBeClickable(
-                        By.xpath("//input[@name='pass']"))).sendKeys(account.password);
+                log(id, info("Login page: " + driver.getCurrentUrl()));
 
-                WebElement loginBtn = wait.until(ExpectedConditions.elementToBeClickable(
-                        By.xpath("//button[@name='login']")));
-                js.executeScript("arguments[0].click();", loginBtn);
+                WebElement emailField = wait.until(ExpectedConditions.elementToBeClickable(
+                        By.xpath("//input[@name='email' or @id='email' or @type='email']")));
+                emailField.clear();
+                emailField.sendKeys(account.email);
+
+                WebElement passField = wait.until(ExpectedConditions.elementToBeClickable(
+                        By.xpath("//input[@name='pass' or @id='pass' or @type='password']")));
+                passField.clear();
+                passField.sendKeys(account.password);
+
+                // Prefer a named submit button (www: <button name=login>, mbasic: <input name=login>),
+                // but fall back to submitting the form with Enter — some login variants have no element
+                // named "login" at all, which is why waiting for one timed out.
+                List<WebElement> loginBtns = driver.findElements(By.xpath(
+                        "//button[@name='login'] | //input[@name='login'] " +
+                        "| //*[@type='submit' and (@name='login' or @aria-label='Log in' or @aria-label='Log In')] " +
+                        "| //div[@role='button' and (@aria-label='Log in' or @aria-label='Log In')]"));
+                if (!loginBtns.isEmpty()) {
+                    js.executeScript("arguments[0].click();", loginBtns.get(0));
+                } else {
+                    log(id, warn("No login button found; submitting form via Enter key"));
+                    passField.sendKeys(Keys.RETURN);
+                }
                 Thread.sleep(3000);
+                log(id, info("After submit: " + driver.getCurrentUrl()));
 
                 waitForCaptchaResolution();
 
@@ -139,7 +165,8 @@ public class BotWorker implements Runnable {
                 log(id, warn("Login attempt " + attempt + " failed, retrying..."));
             } catch (Exception e) {
                 log(id, fail("Login attempt " + attempt + ": " + e.getMessage()));
-                if (attempt == maxAttempts) throw new RuntimeException("Login failed");
+                if (attempt == maxAttempts)
+                    throw new RuntimeException("Login failed after " + maxAttempts + " attempts: " + e.getMessage(), e);
             }
         }
     }
@@ -286,49 +313,104 @@ public class BotWorker implements Runnable {
 
     private void selectNewPostsSort(JavascriptExecutor js) {
         try {
-            List<WebElement> newPostsDropdown = driver.findElements(By.xpath(
-                    "//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'new posts')]"));
-            if (!newPostsDropdown.isEmpty()) return;
+            if (isNewPostsSelected()) return;
 
-            List<WebElement> dropdown = driver.findElements(By.xpath(
+            List<WebElement> triggers = driver.findElements(By.xpath(
                     "//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'most relevant')" +
-                    " or contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'recent activity')]"));
-            if (!dropdown.isEmpty()) {
-                js.executeScript("arguments[0].scrollIntoView({block: 'center'});", dropdown.get(0));
-                wait.until(ExpectedConditions.elementToBeClickable(dropdown.get(0))).click();
+                    " or contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'recent activity')" +
+                    " or contains(@aria-label, 'Sort')" +
+                    " or contains(@aria-label, 'sort')]"));
+            if (triggers.isEmpty()) {
+                triggers = driver.findElements(By.xpath(
+                    "//div[@role='button']//span[contains(text(),'Most')] | " +
+                    "//div[@role='button']//span[contains(text(),'Recent')]"));
+            }
+            if (!triggers.isEmpty()) {
+                js.executeScript("arguments[0].scrollIntoView({block: 'center'}); arguments[0].click();", triggers.get(0));
+                Thread.sleep(2000);
                 dismissAlert();
 
-                WebElement newPostsOption = wait.until(ExpectedConditions.elementToBeClickable(
-                        By.xpath("//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'new posts')]")));
-                js.executeScript("arguments[0].click();", newPostsOption);
-                wait.until(ExpectedConditions.presenceOfElementLocated(By.xpath(POST_CONTAINER_XPATH)));
+                List<WebElement> option = driver.findElements(By.xpath(
+                        "//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'new posts') " +
+                        "and not(ancestor::*[contains(@style,'display:none') or contains(@style,'display: none')])]"));
+                if (option.isEmpty()) {
+                    option = driver.findElements(By.xpath(
+                        "//div[@role='menuitem' or @role='option']" +
+                        "[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'new posts')]"));
+                }
+                if (!option.isEmpty()) {
+                    js.executeScript("arguments[0].click();", option.get(0));
+                    Thread.sleep(4000);
+                }
             }
-        } catch (Exception ignored) {}
+        } catch (Exception e) {
+            log(id, warn("Sort dropdown interaction failed: " + e.getMessage()));
+        }
+    }
+
+    private boolean isNewPostsSelected() {
+        try {
+            return !driver.findElements(By.xpath(
+                    "//*[(contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'new posts')" +
+                    " or contains(@aria-label, 'New posts')" +
+                    " or contains(@aria-label, 'new posts'))" +
+                    " and (contains(@class, 'selected') or contains(@aria-selected, 'true') or contains(@aria-current, 'true')" +
+                    " or ancestor::*[contains(@class, 'selected')])]")).isEmpty();
+        } catch (Exception e) { return false; }
     }
 
     private List<WebElement> loadPosts(JavascriptExecutor js) {
         List<WebElement> posts = new ArrayList<>();
         int prevCount = 0, unchanged = 0;
+        int maxScrolls = 40;
 
-        for (int attempt = 1; attempt <= 20 && unchanged < 3; attempt++) {
+        WebElement feedScroller = findFeedScroller();
+        boolean hasFeedScroller = feedScroller != null;
+
+        for (int attempt = 1; attempt <= maxScrolls && posts.size() < 20; attempt++) {
             dismissAlert();
+            removeOverlays(js);
+
             posts = driver.findElements(By.xpath(POST_CONTAINER_XPATH));
-            if (posts.size() >= 10) break;
+            if (posts.size() >= 20) break;
 
             if (posts.size() == prevCount) unchanged++;
             else { unchanged = 0; prevCount = posts.size(); }
+            if (unchanged >= 6) break;
 
-            try {
-                WebElement btn = driver.findElement(By.xpath(
-                        "//span[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'see more')]"));
-                js.executeScript("arguments[0].click();", btn);
-                sleep(2000);
-            } catch (NoSuchElementException ignored) {}
-
-            js.executeScript("window.scrollBy(0, document.body.scrollHeight);");
-            sleep(4000 + ThreadLocalRandom.current().nextInt(2000));
+            if (hasFeedScroller) {
+                js.executeScript("arguments[0].scrollBy(0, arguments[0].clientHeight * 0.8);", feedScroller);
+            } else {
+                js.executeScript("window.scrollBy(0, 1000);");
+            }
+            sleep(3000 + ThreadLocalRandom.current().nextInt(2000));
         }
+
+        if (posts.size() < 3) {
+            log(id, warn("Only found " + posts.size() + " posts, trying deeper scroll..."));
+            for (int i = 0; i < 15; i++) {
+                if (hasFeedScroller) {
+                    js.executeScript("arguments[0].scrollBy(0, arguments[0].scrollHeight * 0.3);", feedScroller);
+                } else {
+                    js.executeScript("window.scrollBy(0, 1500);");
+                }
+                sleep(4000);
+                posts = driver.findElements(By.xpath(POST_CONTAINER_XPATH));
+                if (posts.size() >= 15) break;
+            }
+        }
+
         return posts;
+    }
+
+    private WebElement findFeedScroller() {
+        try {
+            List<WebElement> feeds = driver.findElements(By.xpath("//div[@role='feed']"));
+            if (!feeds.isEmpty()) return feeds.get(0);
+            feeds = driver.findElements(By.xpath("//div[contains(@data-pagelet,'Feed')]"));
+            if (!feeds.isEmpty()) return feeds.get(0);
+        } catch (Exception ignored) {}
+        return null;
     }
 
     private void interactWithPost(WebElement post, int postIndex, JavascriptExecutor js) throws Exception {
@@ -364,6 +446,10 @@ public class BotWorker implements Runnable {
             return;
         }
 
+        if (isAlreadyLiked(currentPost)) {
+            log(id, warn("Post #" + postIndex + " already liked, skipping"));
+            return;
+        }
         clickLikeButton(currentPost, js);
         sleep(ThreadLocalRandom.current().nextInt(1500, 3000));
 
@@ -382,11 +468,31 @@ public class BotWorker implements Runnable {
         sleep(ThreadLocalRandom.current().nextInt(4000, 8000));
     }
 
+    private boolean isAlreadyLiked(WebElement post) {
+        try {
+            List<WebElement> unlikeBtns = post.findElements(By.xpath(
+                ".//*[contains(@aria-label,'Unlike') or contains(@aria-label,'unlike')]"));
+            if (!unlikeBtns.isEmpty() && unlikeBtns.get(0).isDisplayed()) return true;
+            List<WebElement> likedIndicators = post.findElements(By.xpath(
+                ".//span[contains(text(),'Liked')] | .//*[contains(@aria-label,'Unlike')]"));
+            return !likedIndicators.isEmpty();
+        } catch (Exception e) { return false; }
+    }
+
     private void clickLikeButton(WebElement post, JavascriptExecutor js) throws Exception {
         try {
             dismissAlert();
-            WebElement btn = wait.until(ExpectedConditions.elementToBeClickable(post.findElement(
-                    By.xpath(".//div[contains(@class, 'x1i10hfl') and (.//span[contains(text(), 'Like')] or @aria-label='Like')]"))));
+            List<WebElement> btns = post.findElements(By.xpath(
+                ".//*[(contains(@aria-label,'Like') or contains(@aria-label,'like')) " +
+                "and not(contains(@aria-label,'Unlike') or contains(@aria-label,'unlike'))] " +
+                "| .//span[contains(text(),'Like')]/.."));
+            if (btns.isEmpty()) {
+                btns = driver.findElements(By.xpath(
+                    "//*[(contains(@aria-label,'Like') or contains(@aria-label,'like')) " +
+                    "and not(contains(@aria-label,'Unlike') or contains(@aria-label,'unlike'))]"));
+            }
+            if (btns.isEmpty()) throw new Exception("Like button not found");
+            WebElement btn = btns.get(0);
             js.executeScript("arguments[0].scrollIntoView({block: 'center'});", btn);
             sleep(500);
             js.executeScript("arguments[0].click();", btn);
@@ -396,23 +502,25 @@ public class BotWorker implements Runnable {
     }
 
     private void postComment(WebElement post, String comment, JavascriptExecutor js) throws Exception {
-        String btnXPath = ".//div[contains(@class, 'x1i10hfl') and (.//span[contains(translate(text(), 'COMMENT', 'comment'), 'comment')] or contains(@aria-label, 'Comment')) and not(contains(@class, 'x1yztbdb'))]";
-        String primaryTA = "//div[@role='textbox' and @contenteditable='true' and (contains(@class, 'notranslate') or contains(@class, 'x1t2pt76'))]";
-        String fallbackTA = ".//div[contains(@class, 'x1n2onr6')]//div[@contenteditable='true']";
-
         dismissAlert();
         removeOverlays(js);
 
-        WebElement btn = wait.until(ExpectedConditions.elementToBeClickable(post.findElement(By.xpath(btnXPath))));
+        List<WebElement> commentBtns = post.findElements(By.xpath(
+            ".//*[(contains(@aria-label,'Comment') or contains(@aria-label,'comment')) " +
+            "and not(contains(@aria-label,'Uncomment') or contains(@aria-label,'uncomment'))] " +
+            "| .//span[contains(text(),'Comment')]/.."));
+        if (commentBtns.isEmpty()) {
+            commentBtns = driver.findElements(By.xpath(
+                "//*[(contains(@aria-label,'Comment') or contains(@aria-label,'comment')) " +
+                "and not(contains(@aria-label,'Uncomment') or contains(@aria-label,'uncomment'))]"));
+        }
+        if (commentBtns.isEmpty()) throw new Exception("Comment button not found");
+        WebElement btn = commentBtns.get(0);
         js.executeScript("arguments[0].click();", btn);
         sleep(800);
 
-        WebElement textArea;
-        try {
-            textArea = wait.until(ExpectedConditions.elementToBeClickable(By.xpath(primaryTA)));
-        } catch (TimeoutException e) {
-            textArea = wait.until(ExpectedConditions.elementToBeClickable(post.findElement(By.xpath(fallbackTA))));
-        }
+        WebElement textArea = wait.until(ExpectedConditions.elementToBeClickable(
+                By.xpath("//div[@role='textbox' and @contenteditable='true']")));
 
         js.executeScript(
                 "arguments[0].focus(); arguments[0].innerText = arguments[1]; " +
@@ -460,7 +568,12 @@ public class BotWorker implements Runnable {
     }
 
     private void removeOverlays(JavascriptExecutor js) {
-        js.executeScript("document.querySelectorAll('div[role=\"dialog\"], div[class*=\"popup\"], div[class*=\"cookie\"], div[class*=\"modal\"], div[class*=\"tooltip\"]').forEach(el => el.style.display = 'none');");
+        js.executeScript(
+            "document.querySelectorAll('div[role=\"dialog\"], div[role=\"presentation\"], " +
+            "div[class*=\"popup\"], div[class*=\"cookie\"], div[class*=\"modal\"], " +
+            "div[class*=\"tooltip\"], div[aria-modal=\"true\"]').forEach(el => el.style.display = 'none');");
+        js.executeScript(
+            "document.querySelectorAll('[data-pagelet^=\"Dialog\"], [data-pagelet^=\"Modal\"]').forEach(el => el.style.display = 'none');");
     }
 
     private void highlightPost(WebElement post) {
@@ -471,17 +584,36 @@ public class BotWorker implements Runnable {
         String url = driver.getCurrentUrl();
         if (!url.contains("/groups/") || url.contains("/groups/joined") || url.contains("/groups/members"))
             return false;
-        return !driver.findElements(By.xpath("//h1[contains(@class, 'group-name')]")).isEmpty()
-                || !driver.findElements(By.xpath("//div[@role='article']")).isEmpty();
+        try {
+            return wait.until(ExpectedConditions.or(
+                ExpectedConditions.presenceOfElementLocated(By.xpath("//div[@role='article']")),
+                ExpectedConditions.presenceOfElementLocated(By.xpath("//div[contains(@data-pagelet,'Group')]")),
+                ExpectedConditions.presenceOfElementLocated(By.xpath("//h1"))
+            )) != null;
+        } catch (TimeoutException e) {
+            return false;
+        }
     }
 
     private boolean isActiveCaptchaPresent() {
         try {
-            return !driver.findElements(By.xpath(
-                    "//*[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'captcha') " +
-                    "or contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'security check')" +
-                    " or @title='Security Check']"))
-                    .isEmpty();
+            // A genuine challenge puts Facebook on a checkpoint/captcha URL.
+            String url = driver.getCurrentUrl().toLowerCase(Locale.ROOT);
+            if (url.contains("/checkpoint/") || url.contains("captcha")) {
+                return true;
+            }
+
+            // Otherwise require a *visible* captcha widget. A plain text match anywhere on
+            // the page (footer links, hidden markup, etc.) produces false positives, since
+            // normal Facebook pages contain words like "security check".
+            List<WebElement> candidates = driver.findElements(By.xpath(
+                    "//iframe[contains(@src,'captcha') or contains(@src,'recaptcha') or contains(@title,'captcha')] " +
+                    "| //img[contains(@alt,'captcha') or contains(@src,'captcha')] " +
+                    "| //*[@title='Security Check']"));
+            for (WebElement el : candidates) {
+                if (el.isDisplayed()) return true;
+            }
+            return false;
         } catch (Exception e) { return false; }
     }
 
@@ -538,9 +670,13 @@ public class BotWorker implements Runnable {
 
     private String cleanPostText(WebElement post) {
         try {
-            return post.findElements(By.xpath(
-                    ".//div[@data-ad-preview='message'] | .//div[contains(@class,'x1iorvi4')] | .//div[contains(@class,'userContent')]"))
-                    .stream().map(WebElement::getText).collect(Collectors.joining("\n"))
+            List<WebElement> els = post.findElements(By.xpath(
+                    ".//div[@data-ad-preview='message'] | .//div[contains(@data-ad-preview,'message')]"));
+            if (els.isEmpty()) {
+                els = post.findElements(By.xpath(".//div[not(descendant::div)]"));
+            }
+            return els.stream().map(WebElement::getText).filter(t -> t.length() > 20)
+                    .collect(Collectors.joining("\n"))
                     .replaceAll("\\s+", " ").trim();
         } catch (Exception e) { return ""; }
     }

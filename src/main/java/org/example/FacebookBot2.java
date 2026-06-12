@@ -78,14 +78,12 @@ public class FacebookBot2 {
         final String model;
         final int maxInteractions;
         final boolean headless;
-        final boolean incognito;
 
-        public BotConfig(List<AccountInfo> accounts, String model, int maxInteractions, boolean headless, boolean incognito) {
+        public BotConfig(List<AccountInfo> accounts, String model, int maxInteractions, boolean headless) {
             this.accounts = accounts;
             this.model = model;
             this.maxInteractions = maxInteractions;
             this.headless = headless;
-            this.incognito = incognito;
         }
     }
 
@@ -113,10 +111,23 @@ public class FacebookBot2 {
             System.out.println("  " + warn("Could not open terminal. Running in console mode..."));
         }
 
+        // We are the interactive run now: never let the window close silently on
+        // bad input, a login failure, or a crash, so errors stay readable for debugging.
+        try {
+            runBot();
+        } catch (Throwable t) {
+            System.out.println("\n  " + fail("Unexpected error: " + t.getMessage()));
+            t.printStackTrace(System.out);
+        } finally {
+            pauseBeforeExit();
+        }
+    }
+
+    private static void runBot() {
         BotConfig config = interactiveSetup();
         if (config == null) {
-            System.out.println("\n  " + fail("Setup cancelled"));
-            System.exit(1);
+            System.out.println("\n  " + fail("Setup cancelled or invalid input"));
+            return;
         }
 
         Set<String> processedPosts = loadProcessedPosts();
@@ -159,6 +170,35 @@ public class FacebookBot2 {
         System.out.println();
     }
 
+    /**
+     * Keeps the terminal window open until the user acknowledges, so error output
+     * stays readable instead of the window vanishing on exit. Returns immediately
+     * if stdin is not interactive (e.g. piped input) so automated runs don't hang.
+     */
+    private static void pauseBeforeExit() {
+        // When relaunched through a wrapper script (a real terminal window), the
+        // script itself reliably pauses on exit even when Java has no Console, so
+        // skip here to avoid prompting the user twice.
+        if ("true".equals(System.getenv("FACEBOOKBOT_IN_TERMINAL"))) {
+            return;
+        }
+        System.out.println();
+        System.out.print("  " + YLW + "Press Enter to close..." + RST + " ");
+        System.out.flush();
+        try {
+            Console console = System.console();
+            if (console != null) {
+                console.readLine();
+            } else {
+                int c;
+                while ((c = System.in.read()) != -1 && c != '\n') {
+                    // drain the rest of the line
+                }
+            }
+        } catch (IOException ignored) {
+        }
+    }
+
     private static boolean isRunningInTerminal() {
         if ("true".equals(System.getenv("FACEBOOKBOT_IN_TERMINAL"))) return true;
         return System.console() != null;
@@ -178,7 +218,8 @@ public class FacebookBot2 {
                         "title FacebookBot2",
                         "set FACEBOOKBOT_IN_TERMINAL=true",
                         "\"" + javaBin + "\" -cp \"" + classpath + "\" " + mainClass,
-                        "if errorlevel 1 pause"
+                        "echo.",
+                        "pause"
                 ));
                 Runtime.getRuntime().exec("cmd.exe /c start \"\" \"" + bat.toAbsolutePath() + "\"");
                 return true;
@@ -190,8 +231,11 @@ public class FacebookBot2 {
                         "#!/bin/bash",
                         "export FACEBOOKBOT_IN_TERMINAL=true",
                         "cd '" + escapedDir + "'",
-                        "exec \"" + javaBin + "\" -cp '" + escapedCp + "' " + mainClass,
-                        "[ $? -ne 0 ] && read -p \"Press Enter to close...\""
+                        "\"" + javaBin + "\" -cp '" + escapedCp + "' " + mainClass,
+                        "code=$?",
+                        "echo",
+                        "read -p \"Press Enter to close...\" _",
+                        "exit $code"
                 ));
                 script.toFile().setExecutable(true);
                 Runtime.getRuntime().exec(new String[]{
@@ -207,8 +251,11 @@ public class FacebookBot2 {
                         "#!/bin/bash",
                         "export FACEBOOKBOT_IN_TERMINAL=true",
                         "cd '" + escapedDir + "'",
-                        "exec \"" + javaBin + "\" -cp '" + escapedCp + "' " + mainClass,
-                        "[ $? -ne 0 ] && read -p \"Press Enter to close...\""
+                        "\"" + javaBin + "\" -cp '" + escapedCp + "' " + mainClass,
+                        "code=$?",
+                        "echo",
+                        "read -p \"Press Enter to close...\" _",
+                        "exit $code"
                 ));
                 script.toFile().setExecutable(true);
                 String[] terminals = {"x-terminal-emulator", "gnome-terminal", "xfce4-terminal", "konsole", "lxterminal", "xterm"};
@@ -313,14 +360,19 @@ public class FacebookBot2 {
                     "@echo off",
                     "set FACEBOOKBOT_IN_TERMINAL=true",
                     "\"" + System.getProperty("java.home") + "\\bin\\java\" -jar \"" + jarPath.toAbsolutePath() + "\" %*",
-                    "if errorlevel 1 pause"
+                    "echo.",
+                    "pause"
             ));
         } else {
             Path script = installDir.resolve("facebookbot");
             Files.write(script, List.of(
                     "#!/bin/bash",
                     "export FACEBOOKBOT_IN_TERMINAL=true",
-                    "exec \"" + System.getProperty("java.home") + "/bin/java\" -jar \"" + jarPath.toAbsolutePath() + "\" \"$@\""
+                    "\"" + System.getProperty("java.home") + "/bin/java\" -jar \"" + jarPath.toAbsolutePath() + "\" \"$@\"",
+                    "code=$?",
+                    "echo",
+                    "read -p \"Press Enter to close...\" _",
+                    "exit $code"
             ));
             script.toFile().setExecutable(true);
         }
@@ -408,28 +460,16 @@ public class FacebookBot2 {
         Console console = System.console();
         Scanner scanner = console == null ? new Scanner(System.in) : null;
 
-        header("FacebookBot2", "Multi-Account Engagement Tool (Ollama + Gemma 4)");
+        header("SpaveCraft Bot", "Facebook Marketing Agent");
 
-        // Number of accounts
-        String numStr = promptInput("How many Facebook accounts", null, false, console, scanner);
-        int numAccounts;
-        try {
-            numAccounts = Integer.parseInt(numStr.trim());
-            if (numAccounts < 1) throw new NumberFormatException();
-        } catch (NumberFormatException e) {
-            System.out.println("  " + fail("Invalid number"));
-            return null;
-        }
+        // Number of accounts (re-prompts until a valid positive number is given)
+        int numAccounts = promptPositiveInt("How many Facebook accounts", null, console, scanner);
 
         List<AccountInfo> accounts = new ArrayList<>();
         for (int i = 0; i < numAccounts; i++) {
             System.out.println("\n  " + CYN + "\u2500".repeat(30) + " Account #" + (i + 1) + " " + "\u2500".repeat(30) + RST);
-            String email = promptInput("  Email", null, false, console, scanner);
-            String password = promptInput("  Password", null, true, console, scanner);
-            if (email == null || email.isBlank() || password == null || password.isBlank()) {
-                System.out.println("  " + fail("Email and password are required"));
-                return null;
-            }
+            String email = promptRequired("  Email", false, console, scanner);
+            String password = promptRequired("  Password", true, console, scanner);
             accounts.add(new AccountInfo(email.trim(), password));
         }
 
@@ -438,25 +478,57 @@ public class FacebookBot2 {
         String model = promptInput("  Ollama model", "gemma4:2b", false, console, scanner);
         if (model == null || model.isBlank()) model = "gemma4:2b";
 
-        String maxStr = promptInput("  Max total interactions", "70", false, console, scanner);
-        int maxInteractions;
-        try {
-            maxInteractions = Integer.parseInt(maxStr.trim());
-            if (maxInteractions < 1) throw new NumberFormatException();
-        } catch (NumberFormatException e) {
-            maxInteractions = 70;
-        }
+        int maxInteractions = promptPositiveInt("  Max total interactions", 70, console, scanner);
 
         String headlessStr = promptInput("  Headless mode? (y/N)", "n", false, console, scanner);
         boolean headless = headlessStr.equalsIgnoreCase("y") || headlessStr.equalsIgnoreCase("yes");
 
-        String incognitoStr = promptInput("  Incognito mode? (y/N)", "n", false, console, scanner);
-        boolean incognito = incognitoStr.equalsIgnoreCase("y") || incognitoStr.equalsIgnoreCase("yes");
-
         System.out.println();
-        return new BotConfig(accounts, model, maxInteractions, headless, incognito);
+        return new BotConfig(accounts, model, maxInteractions, headless);
     }
 
+    /**
+     * Repeatedly prompts until the user enters a positive whole number. Pressing Enter
+     * with no value uses {@code defaultValue} when one is provided. Returns the default
+     * (or aborts via exception when there is none) only if the input stream reaches EOF.
+     */
+    private static int promptPositiveInt(String label, Integer defaultValue, Console console, Scanner scanner) {
+        String def = defaultValue == null ? null : String.valueOf(defaultValue);
+        while (true) {
+            String input = promptInput(label, def, false, console, scanner);
+            if (input == null) { // EOF (e.g. Ctrl-D) — nothing more to read
+                if (defaultValue != null) return defaultValue;
+                throw new IllegalStateException("No input available for: " + label.trim());
+            }
+            try {
+                int value = Integer.parseInt(input.trim());
+                if (value >= 1) return value;
+            } catch (NumberFormatException ignored) {
+            }
+            System.out.println("  " + fail("Please enter a whole number greater than 0, then press Enter."));
+        }
+    }
+
+    /**
+     * Repeatedly prompts until the user enters a non-blank value. Aborts via exception
+     * only if the input stream reaches EOF with nothing entered.
+     */
+    private static String promptRequired(String label, boolean secret, Console console, Scanner scanner) {
+        while (true) {
+            String input = promptInput(label, null, secret, console, scanner);
+            if (input == null) { // EOF
+                throw new IllegalStateException("No input available for: " + label.trim());
+            }
+            if (!input.isBlank()) return input;
+            System.out.println("  " + fail("This field can't be empty, please try again."));
+        }
+    }
+
+    /**
+     * Prints the prompt and reads one line. Returns {@code null} only on EOF so callers
+     * can tell "user pressed Enter" (empty string) apart from "no more input". A blank
+     * line falls back to {@code defaultValue} when one is supplied.
+     */
     private static String promptInput(String label, String defaultValue, boolean secret, Console console, Scanner scanner) {
         String prompt = "  " + BLD + label + RST;
         if (defaultValue != null) {
@@ -464,17 +536,24 @@ public class FacebookBot2 {
         }
         prompt += " > ";
 
+        String input;
         if (secret && console != null) {
             char[] chars = console.readPassword(prompt);
-            return chars == null ? "" : new String(chars);
+            input = chars == null ? null : new String(chars);
         } else if (console != null) {
-            String input = console.readLine(prompt);
-            return (input == null || input.isBlank()) && defaultValue != null ? defaultValue : (input == null ? "" : input);
+            input = console.readLine(prompt);
         } else {
             System.out.print(prompt);
-            String input = scanner.nextLine();
-            return (input == null || input.isBlank()) && defaultValue != null ? defaultValue : (input == null ? "" : input);
+            try {
+                input = scanner.nextLine();
+            } catch (NoSuchElementException e) {
+                input = null; // EOF
+            }
         }
+
+        if (input == null) return defaultValue;                  // EOF -> default (may be null)
+        if (input.isBlank() && defaultValue != null) return defaultValue;
+        return input;
     }
 
     // --- Shared helpers ---
