@@ -78,12 +78,17 @@ public class FacebookBot2 {
         final String model;
         final int maxInteractions;
         final boolean headless;
+        final boolean debugPostDetection;
+        final int debugGroupLimit;
 
-        public BotConfig(List<AccountInfo> accounts, String model, int maxInteractions, boolean headless) {
+        public BotConfig(List<AccountInfo> accounts, String model, int maxInteractions, boolean headless,
+                         boolean debugPostDetection, int debugGroupLimit) {
             this.accounts = accounts;
             this.model = model;
             this.maxInteractions = maxInteractions;
             this.headless = headless;
+            this.debugPostDetection = debugPostDetection;
+            this.debugGroupLimit = debugGroupLimit;
         }
     }
 
@@ -133,12 +138,13 @@ public class FacebookBot2 {
         Set<String> processedPosts = loadProcessedPosts();
         AtomicInteger totalInteractions = new AtomicInteger(0);
         OkHttpClient httpClient = new OkHttpClient();
-        ExecutorService executor = Executors.newFixedThreadPool(config.accounts.size());
+        int workerCount = config.debugPostDetection ? 1 : config.accounts.size();
+        ExecutorService executor = Executors.newFixedThreadPool(workerCount);
 
         header("FacebookBot2 - Running",
                 "Model: " + config.model + " (Ollama)  |  Interactions: 0/" + config.maxInteractions);
 
-        for (int i = 0; i < config.accounts.size(); i++) {
+        for (int i = 0; i < workerCount; i++) {
             BotWorker worker = new BotWorker(
                     i + 1, config.accounts.get(i), config,
                     totalInteractions, processedPosts, httpClient);
@@ -483,8 +489,14 @@ public class FacebookBot2 {
         String headlessStr = promptInput("  Headless mode? (y/N)", "n", false, console, scanner);
         boolean headless = headlessStr.equalsIgnoreCase("y") || headlessStr.equalsIgnoreCase("yes");
 
+        String debugStr = promptInput("  Debug post detection only? (y/N)", "n", false, console, scanner);
+        boolean debugPostDetection = debugStr.equalsIgnoreCase("y") || debugStr.equalsIgnoreCase("yes");
+        int debugGroupLimit = debugPostDetection
+                ? promptPositiveInt("  Debug group capture limit", 5, console, scanner)
+                : 0;
+
         System.out.println();
-        return new BotConfig(accounts, model, maxInteractions, headless);
+        return new BotConfig(accounts, model, maxInteractions, headless, debugPostDetection, debugGroupLimit);
     }
 
     /**
